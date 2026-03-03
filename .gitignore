@@ -1,0 +1,36 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+# Keep .streamlit folder structure but ignore secrets
+# .streamlit/
+
+# Data and Cache
+data/
+*.csv
+*.json
+*.log
+!requirements.txt
+!README.md
+
+# Dhan API - Large file, download via app
+api-scrip-master.csv
+token.json
+ltp_cache.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
