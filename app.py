@@ -8,6 +8,7 @@ import gzip
 import shutil
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
+import zipfile
 
 # IST Offset
 IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -150,22 +151,40 @@ def extract_date_from_filename(filename):
         return f"{d[:4]}-{d[4:6]}-{d[6:]}"
     return None
 
-def load_dhan_creds():
+def extract_csv_from_zip(zip_file):
+    try:
+        # zip_file is a UploadedFile object from streamlit
+        with zipfile.ZipFile(zip_file) as z:
+            # Find the first CSV file in the ZIP
+            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
+            if not csv_files:
+                st.error("No CSV file found in the ZIP archive.")
+                return None, None
+            
+            # Extract the first CSV found
+            csv_filename = csv_files[0]
+            with z.open(csv_filename) as f:
+                return f.read(), csv_filename
+    except Exception as e:
+        st.error(f"Error extracting ZIP file: {e}")
+        return None, None
+
+def load_token():
     if os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, 'r') as f:
                 data = json.load(f)
-                return data.get('access_token', ''), data.get('client_id', '')
+                if data.get('date') == get_ist_now().strftime('%Y-%m-%d'):
+                    return data.get('token', '')
         except:
             pass
-    return '', ''
+    return ''
 
-def save_dhan_creds(access_token, client_id):
+def save_token(token):
     try:
         data = {
             'date': get_ist_now().strftime('%Y-%m-%d'),
-            'access_token': access_token,
-            'client_id': client_id
+            'token': token
         }
         with open(TOKEN_FILE, 'w') as f:
             json.dump(data, f)
@@ -194,54 +213,24 @@ def save_blacklist(keys):
     except:
         pass
 
-# Constant for Dhan Scrip Master
-DHAN_MASTER_PATH = 'api-scrip-master.csv'
+# Constant for NSE JSON
+NSE_JSON_PATH = 'NSE.json'
 
 @st.cache_data
-def load_dhan_master():
-    if os.path.exists(DHAN_MASTER_PATH):
+def load_nse_json():
+    if os.path.exists(NSE_JSON_PATH):
         try:
-            # Read CSV - specific columns to save memory
-            use_cols = [
-                'SEM_EXM_EXCH_ID', 'SEM_SEGMENT', 'SEM_SMST_SECURITY_ID', 
-                'SEM_TRADING_SYMBOL', 'SEM_EXPIRY_DATE', 'SEM_STRIKE_PRICE', 
-                'SEM_OPTION_TYPE'
-            ]
-            df = pd.read_csv(DHAN_MASTER_PATH, usecols=use_cols)
-            
-            # Filter for NSE Derivatives (Futures & Options)
-            # We specifically need Options for the ATM mapping
-            df = df[
-                (df['SEM_EXM_EXCH_ID'] == 'NSE') & 
-                (df['SEM_SEGMENT'] == 'D') &
-                (df['SEM_OPTION_TYPE'].isin(['CE', 'PE']))
-            ].copy()
-            
-            # Extract Underlying Symbol from Trading Symbol
-            # Format: SYMBOL-MonYear-Strike-Type (e.g. RELIANCE-Feb2026-1200-CE)
-            # Regex captures everything before the first hyphen followed by MonthYear
-            df['underlying_symbol'] = df['SEM_TRADING_SYMBOL'].str.extract(r'^(.*?)-[A-Z][a-z]{2}\d{4}-')
-            
-            # Convert Expiry
-            df['expiry_dt'] = pd.to_datetime(df['SEM_EXPIRY_DATE']).dt.normalize()
-            
-            # Rename columns to match expected format
-            df = df.rename(columns={
-                'SEM_SMST_SECURITY_ID': 'instrument_key',
-                'SEM_STRIKE_PRICE': 'strike_price',
-                'SEM_OPTION_TYPE': 'instrument_type'
-            })
-            
-            # Convert instrument_key to string as it might be int
-            df['instrument_key'] = df['instrument_key'].astype(str)
-            
-            return df[['underlying_symbol', 'strike_price', 'instrument_type', 'expiry_dt', 'instrument_key']]
-            
+            df = pd.read_json(NSE_JSON_PATH)
+            # Pre-process JSON
+            if 'segment' in df.columns:
+                df = df[df['segment'] == 'NSE_FO']
+            df['expiry_dt'] = pd.to_datetime(df['expiry'], unit='ms').dt.normalize()
+            return df
         except Exception as e:
-            st.error(f"Error loading Dhan master: {e}")
+            st.error(f"Error loading NSE.json: {e}")
             return pd.DataFrame()
     else:
-        st.error(f"Dhan scrip master not found at {DHAN_MASTER_PATH}")
+        st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
 
 def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
@@ -318,7 +307,7 @@ def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
         # Normalize dates for merging
         atm_rows['XpryDt'] = atm_rows['XpryDt'].dt.normalize()
 
-        # Merge with Dhan Scrip Master
+        # Merge with Upstox JSON
         result = pd.merge(
             atm_rows,
             df_json,
@@ -358,59 +347,41 @@ def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
         st.error(f"Error processing file: {e}")
         return pd.DataFrame()
 
-def fetch_ltp(instrument_keys, access_token, client_id):
-    if not access_token or not client_id:
+def fetch_ltp(instrument_keys, token):
+    if not token:
         return {}
     
-    url = "https://api.dhan.co/v2/marketfeed/ltp"
+    url = "https://api.upstox.com/v3/market-quote/ltp"
     headers = {
         'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'access-token': access_token,
-        'client-id': client_id
+        'Authorization': f'Bearer {token}'
     }
     
-    # Dhan allows up to 1000 instruments
-    batch_size = 1000
+    batch_size = 50
     ltp_map = {}
     
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
     
     def fetch_batch(batch):
-        # Construct payload for NSE_FNO
-        # Ensure keys are integers if Dhan expects integers, but JSON keys are strings usually.
-        # Based on documentation example: "NSE_FNO":[49081,49082] -> Integers.
-        # But my instrument_key is string. I should convert to int for the list.
+        params = {'instrument_key': ','.join(batch)}
         try:
-            ids = [int(k) for k in batch]
-        except:
-            # Fallback if any key is not int
-            ids = batch
-            
-        payload = {
-            "NSE_FNO": ids
-        }
-        
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if data.get('status') == 'success':
-                    # Structure: data -> NSE_FNO -> id -> last_price
-                    fno_data = data.get('data', {}).get('NSE_FNO', {})
+                    quotes = data.get('data', {})
                     result = {}
-                    for key, details in fno_data.items():
-                        # key is the security ID
+                    for key, details in quotes.items():
+                        inst_token = details.get('instrument_token')
                         last_price = details.get('last_price')
-                        if last_price is not None:
-                            result[str(key)] = last_price
+                        if inst_token is not None:
+                            result[inst_token] = last_price
                     return result
-        except Exception as e:
-            # st.error(f"Fetch error: {e}") # Debug only
+        except Exception:
             pass
         return {}
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_batch, batch) for batch in batches]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -422,14 +393,14 @@ def fetch_ltp(instrument_keys, access_token, client_id):
     
     return ltp_map
 
-def display_option_chain(df, access_token, client_id, key_suffix):
+def display_option_chain(df, access_token, key_suffix):
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info("No data to display. Please upload a valid Bhavcopy in the sidebar.")
         return
 
     # Fetch LTP if token provided
-    if access_token and client_id:
+    if access_token:
         all_keys = df['instrument_key'].dropna().unique().tolist()
         
         # Time-based Fetch Logic
@@ -461,7 +432,7 @@ def display_option_chain(df, access_token, client_id, key_suffix):
         if should_fetch:
             keys_to_fetch = all_keys if is_market_hours else missing_keys
             # Fetch silently
-            fetched_data = fetch_ltp(keys_to_fetch, access_token, client_id)
+            fetched_data = fetch_ltp(keys_to_fetch, access_token)
             if fetched_data:
                 save_ltp_cache(fetched_data)
                 # Reload cache to get complete set
@@ -473,7 +444,7 @@ def display_option_chain(df, access_token, client_id, key_suffix):
         df['ltp'] = df['instrument_key'].map(ltp_data).fillna(0.0)
     else:
         df['ltp'] = 0.0
-        st.warning("Enter Access Token and Client ID in sidebar to see live LTP.")
+        st.warning("Enter Access Token in sidebar to see live LTP.")
 
     # If Intraday, replace Trigger with Camarilla_R4
     if key_suffix == 'Intraday' and 'Camarilla_R4' in df.columns:
@@ -570,12 +541,13 @@ def display_option_chain(df, access_token, client_id, key_suffix):
         )
 
 # --- Configuration Logic (Before Sidebar) ---
-is_client_view = "DHAN_ACCESS_TOKEN" in st.secrets and "DHAN_CLIENT_ID" in st.secrets
+# Check if we should enter "Client View" (No Sidebar, Token from Secrets)
+# To see the sidebar (Admin View), remove or comment out UPSTOX_ACCESS_TOKEN in .streamlit/secrets.toml
+is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
 
 if is_client_view:
     # CLIENT VIEW DEFAULTS
-    access_token = st.secrets["DHAN_ACCESS_TOKEN"]
-    client_id = st.secrets["DHAN_CLIENT_ID"]
+    access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
     # Hide sidebar completely for clients
     st.markdown("""
     <style>
@@ -594,13 +566,11 @@ else:
         st.header("Configuration")
         
         # Local Token Logic
-        saved_access_token, saved_client_id = load_dhan_creds()
+        saved_token = load_token()
+        access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
         
-        client_id = st.text_input("Dhan Client ID", value=saved_client_id)
-        access_token = st.text_input("Dhan Access Token", value=saved_access_token, type="password")
-        
-        if (access_token and access_token != saved_access_token) or (client_id and client_id != saved_client_id):
-            save_dhan_creds(access_token, client_id)
+        if access_token and access_token != saved_token:
+            save_token(access_token)
 
         st.markdown("---")
         st.header("Expiry Settings")
@@ -616,48 +586,44 @@ else:
         st.markdown("---")
         st.header("Data Management")
         
-        # Dhan Scrip Master Uploader
-        st.subheader("Dhan Scrip Master")
+        # NSE JSON Uploader
+        st.subheader("NSE Instrument JSON")
         
-        if st.button("Download Latest Master"):
-            with st.spinner("Downloading Scrip Master..."):
-                try:
-                    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    with open(DHAN_MASTER_PATH, "wb") as f:
-                        f.write(response.content)
-                    st.cache_data.clear()
-                    st.success("Downloaded & Updated!")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Download failed: {e}")
+        if st.button("🔄 Download Latest"):
+            try:
+                with st.spinner("Downloading latest NSE.json from Upstox..."):
+                    url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    response = requests.get(url, headers=headers, stream=True)
+                    if response.status_code == 200:
+                        with open(NSE_JSON_PATH, "wb") as f_out:
+                            with gzip.GzipFile(fileobj=response.raw) as f_in:
+                                shutil.copyfileobj(f_in, f_out)
+                        st.cache_data.clear()
+                        st.success("Updated successfully!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to download. Status: {response.status_code}")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-        up_master = st.file_uploader("Upload api-scrip-master.csv", type=['csv'], key='master_up')
-        if up_master is not None:
-             with open(DHAN_MASTER_PATH, "wb") as f:
-                 f.write(up_master.getbuffer())
-             st.cache_data.clear()
-             st.success("Scrip master updated!")
-             time.sleep(1)
-             st.rerun()
-
-        if os.path.exists(DHAN_MASTER_PATH):
-             m_time = os.path.getmtime(DHAN_MASTER_PATH)
-             st.caption(f"📅 Last Updated: {datetime.fromtimestamp(m_time).strftime('%Y-%m-%d %H:%M')}")
         
         # Monthly Uploader
         st.subheader("Monthly")
-        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['csv'], key='m_up')
+        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['zip'], key='m_up')
         if up_m is not None:
-            with open(FILES['Monthly'], "wb") as f:
-                f.write(up_m.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_m.name)
-            if date_str:
-                save_meta('Monthly', date_str)
-            st.success("Monthly file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_m)
+            if csv_content:
+                with open(FILES['Monthly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date from the CSV filename within the ZIP
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Monthly', date_str)
+                st.success(f"Monthly file updated from {csv_name}!")
         
         meta = load_meta()
         if 'Monthly' in meta and os.path.exists(FILES['Monthly']):
@@ -669,15 +635,17 @@ else:
         
         # Weekly Uploader
         st.subheader("Weekly")
-        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['csv'], key='w_up')
+        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['zip'], key='w_up')
         if up_w is not None:
-            with open(FILES['Weekly'], "wb") as f:
-                f.write(up_w.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_w.name)
-            if date_str:
-                save_meta('Weekly', date_str)
-            st.success("Weekly file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_w)
+            if csv_content:
+                with open(FILES['Weekly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Weekly', date_str)
+                st.success(f"Weekly file updated from {csv_name}!")
 
         if 'Weekly' in meta and os.path.exists(FILES['Weekly']):
             st.caption(f"📅 Data Date: {meta['Weekly']}")
@@ -687,15 +655,17 @@ else:
         
         # Intraday Uploader
         st.subheader("Intraday")
-        up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['csv'], key='i_up')
+        up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['zip'], key='i_up')
         if up_i is not None:
-            with open(FILES['Intraday'], "wb") as f:
-                f.write(up_i.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_i.name)
-            if date_str:
-                save_meta('Intraday', date_str)
-            st.success("Intraday file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_i)
+            if csv_content:
+                with open(FILES['Intraday'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Intraday', date_str)
+                st.success(f"Intraday file updated from {csv_name}!")
         
         if 'Intraday' in meta and os.path.exists(FILES['Intraday']):
             st.caption(f"📅 Data Date: {meta['Intraday']}")
@@ -709,12 +679,12 @@ else:
         refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 
 # --- Main Page ---
-st.title("Positional Stock Option Scanner (Dhan)")
+st.title("Positional Stock Option Scanner")
 # st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 
-dhan_master_df = load_dhan_master()
+nse_json_df = load_nse_json()
 
-if not dhan_master_df.empty:
+if not nse_json_df.empty:
     tab1, tab2, tab3 = st.tabs(["Monthly", "Weekly", "Intraday"])
     
     run_every = refresh_interval if auto_refresh else None
@@ -724,8 +694,8 @@ if not dhan_master_df.empty:
         if os.path.exists(FILES['Monthly']):
             @st.fragment(run_every=run_every)
             def show_monthly():
-                df_m = process_bhavcopy(FILES['Monthly'], dhan_master_df, target_expiry_index=target_expiry_idx)
-                display_option_chain(df_m, access_token, client_id, "Monthly")
+                df_m = process_bhavcopy(FILES['Monthly'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_m, access_token, "Monthly")
             show_monthly()
         else:
             st.info("Please upload a Monthly Bhavcopy in the sidebar to view data.")
@@ -735,8 +705,8 @@ if not dhan_master_df.empty:
         if os.path.exists(FILES['Weekly']):
             @st.fragment(run_every=run_every)
             def show_weekly():
-                df_w = process_bhavcopy(FILES['Weekly'], dhan_master_df, target_expiry_index=target_expiry_idx)
-                display_option_chain(df_w, access_token, client_id, "Weekly")
+                df_w = process_bhavcopy(FILES['Weekly'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_w, access_token, "Weekly")
             show_weekly()
         else:
             st.info("Please upload a Weekly Bhavcopy in the sidebar to view data.")
@@ -746,11 +716,11 @@ if not dhan_master_df.empty:
         if os.path.exists(FILES['Intraday']):
             @st.fragment(run_every=run_every)
             def show_intraday():
-                df_i = process_bhavcopy(FILES['Intraday'], dhan_master_df, target_expiry_index=target_expiry_idx)
-                display_option_chain(df_i, access_token, client_id, "Intraday")
+                df_i = process_bhavcopy(FILES['Intraday'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_i, access_token, "Intraday")
             show_intraday()
         else:
             st.info("Please upload an Intraday Bhavcopy in the sidebar to view data.")
 
 else:
-    st.error("Critical Error: Dhan Scrip Master could not be loaded.")
+    st.error("Critical Error: NSE.json could not be loaded.")
